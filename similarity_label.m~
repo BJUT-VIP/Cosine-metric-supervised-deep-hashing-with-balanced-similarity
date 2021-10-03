@@ -1,0 +1,13 @@
+% calculate a logic matrix indicating whether a pair of items are neighbors.
+function [S, R] = similarity_label(label)
+        
+    DR = label' * label >0;
+    S = DR > 0;
+    mD = max(DR, [], 2);
+    R = DR ./ mD;
+    R(fin)
+%     DR(find(DR == 0))= -1;
+%     R = 1./ DR;
+%     R(find(R<0)) = 0;
+
+end

@@ -1,0 +1,107 @@
+function [net, U, B, loss, loss1_1, loss2_1, loss3] = train (imdb, data_train, batchFunc, U, B, net, iter ,lr,eta) %数据分别为训练数据、标签、哈希层实数、哈希值、网络结构、学习率、超参数
+    N = numel(data_train);
+    data_train = data_train(randperm(N));  
+    batchsize = 128 ;   %训练一次的大小
+    num = 0;
+    myLogInfo('Epoch %d, learningRate = %d', iter, lr);
+    numSubBatches = 1;
+for t=1:batchsize:numel(data_train)
+    batchSize = min(batchsize, N - t + 1) ;
+    for s=1:numSubBatches
+        % get this image batch and prefetch the next，获取此图像批处理并预取下一个
+        batchStart = t + (labindex-1) + (s-1) * numlabs ;
+        batchEnd = min(t+ batchSize-1, N) ;
+        batch = data_train(batchStart : numSubBatches * numlabs : batchEnd) ;
+        num = num + numel(batch) ;
+        if numel(batch) == 0, continue ; end
+        [im_, labels] = batchFunc(imdb, batch) ;
+        
+        batch_time=tic ;     %计算时间开始
+        %% random select a minibatch
+        S = calcNeighbor (imdb.images.labels', labels, data_train) ;  %计算128和整个训练集的相似程度矩阵，1为相似，为0则不相似
+        %% load and preprocess an image
+        im_ = gpuArray(im_) ;  %把MATLAB工作空间中的数据传送到GPU上
+        %% run the CNN
+        res = vl_simplenn(net, im_) ; %放入数据运行网络
+        U0 = squeeze(gather(res(end).x))' ; %res(end).x 表示最后一层，gather为把GPU上的数据转换成CPU数据，squeeze为删除单一维度
+        U(batchStart:batchEnd,:)  = U0 ;  %把相应的哈希层实数放入到总U中
+        B(batchStart:batchEnd,:) = sign(U0) ;   %把相应的哈希层数据进行二值化
+         
+%         label = L1+1;       %把所有标签数据值加1 从1开始，默认中标签数据是从0开始，MATLAB是从1开始 所以要加1
+        batchLabel = labels;  %每个batchsize相应标签数据
+        %% 下面的这段代码是标签构造one-hot码，作为分类监督信息
+        if isvector(batchLabel)   %判断是否为一维向量
+            batchY = sparse(1:length(batchLabel), double(batchLabel), 1); %sparse为创建稀疏矩阵，S=sparse(X)—将矩阵X转化为
+            %稀疏矩阵的形式，即矩阵X中任何零元素去除，非零元素及其下标（索引）组成矩阵S。 如果X本身是稀疏的，sparse(X)返回S
+            batchY = full(batchY);  %full为把稀疏矩阵转换为全矩阵形式
+            batchY(find(batchY == 0)) = -1;
+        else
+            batchY = batchLabel;
+            batchY(find(batchY == 0)) = -1;
+        end    
+        %% 
+        lambda= 0.001;    %权重正则化系数为0.1*||W||2 除以分类系数
+        batchB=sign(U0);  %哈希层batchsize量化成哈希码  
+%         [Wg, ~, E] = RRC(batchB, batchY, lambda);   %该函数的功能为计算哈希层乘以分类层得到的权重 
+%         Q = eta*U0 + batchY*Wg';            
+%         batchB = zeros(size(batchB));          
+%         for time = 1:10           
+%                Z0 = batchB;
+%                 for k = 1 : size(batchB,2)
+%                     Zk = batchB; Zk(:,k) = [];
+%                     Wkk = Wg(k,:); Wk = Wg; Wk(k,:) = [];                    
+%                     batchB(:,k) = sign(Q(:,k) -  Zk*Wk*Wkk');
+%                 end
+%                 
+%                 if norm(batchB-Z0,'fro') < 1e-6 * norm(Z0,'fro') %‘fro'计算一个稀疏矩阵的 Frobenius 范数，该稀疏矩阵计算列向量 S(:) 的 2-范数。
+%                     break
+%                 end
+%         end
+        %% 计算余弦距离
+        dot = U0 * U';
+%         u0_norm = zeros(size(U0, 1), 1);
+%         u_norm = zeros(size(U, 1), 1);
+        u0_norm = sum(abs(U0).^2, 2).^(1/2);
+        u_norm = sum(abs(U).^2, 2).^(1/2);
+        norm_dot = u0_norm * u_norm';
+        norm_dot(find(norm_dot == 0)) = 1e-6;
+        cosine_similarity = dot ./ norm_dot;
+        panduan = cosine_similarity >0;
+        loss1 = (S .* cosine_similarity + (1-S).* panduan);
+        loss2 = eta * (batchB - U0).^2;
+        E=1;
+        loss3 = E;
+        loss1_1 = mean(loss1(:));
+        loss2_1 = mean(loss2(:));
+%         loss3_1 = mean(loss3(:));
+        loss = loss1_1 + loss2_1 + loss3;
+
+        %% 开始余弦求导
+        p_norm_dot = S ./ norm_dot;
+        part_1 = p_norm_dot * U;
+        u01_norm = u0_norm.^3;
+        norm_dot1 = u01_norm * u_norm';
+        norm_dot1(find(norm_dot1 == 0)) = 1e-6;
+        snorm_dot1 = S ./ norm_dot1;
+        part_2 = sum(dot .* snorm_dot1, 2);
+        jiandu = cosine_similarity > 0;
+        p_norm_dot1 = ((1 - S) .* jiandu) ./ norm_dot;
+        npart_1 = p_norm_dot1 * U;
+        snorm_dot2 = ((1 - S) .* jiandu) ./ norm_dot1;
+        npart_2 = sum(dot .* snorm_dot2, 2);
+        cosine_grad = (part_1 - part_2 .* U0) - (npart_1 - npart_2 .* U0);
+        
+        dJdU = 2 * cosine_grad  - 2*eta*(U0-batchB);
+        
+        %A = 1 ./ (1 + exp(-T)) ; 
+        %dJdU = (S - A) * U - 2*eta*(U0-batchB) ;       
+        dJdoutput = gpuArray(reshape(dJdU',[1,1,size(dJdU',1),size(dJdU',2)])) ;
+        res = vl_simplenn(net, im_, dJdoutput) ;
+        %% update the parameters of CNN
+        net = update1(net , res, lr, N) ;
+        batch_time = toc(batch_time) ;
+        fprintf(' iter %d  batch %d/%d (%.1f images/s) ,lr is %d  ', iter, j+1,ceil(size(X1,4)/batchsize), batchsize/ batch_time,lr) ;
+        fprintf('loss is %.5f loss1_1 %.5f loss2_1 %.5f loss3_1 %.5f\n',loss, loss1_1,loss2_1, loss3);
+    end
+end
+end
